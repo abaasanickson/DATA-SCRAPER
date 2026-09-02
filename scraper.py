@@ -1,30 +1,24 @@
+import os
 import re
 import time
+import json
 import urllib.parse
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
-import threading
-import os
 from bs4 import BeautifulSoup
 
-# Optional browser fallback. The scraper still works with requests if Playwright/Chromium
-# is unavailable in the deployment environment.
-try:
-    from playwright.sync_api import sync_playwright
-except Exception:
-    sync_playwright = None
-
 SEARCH_BUDGET_SECONDS = 90
-SOURCE_BUDGET_SECONDS = 15
-REQUEST_TIMEOUT = 4
+DEFAULT_SOURCE_BUDGET_SECONDS = 25
+YELLOW_SOURCE_BUDGET_SECONDS = 45
+REQUEST_TIMEOUT = 5
 BROWSER_TIMEOUT = 7000
 MAX_RECORDS_PER_SOURCE = 10000
 MAX_TOTAL_RESULTS = 50000
-MAX_PAGES_PER_SOURCE = 500
-MAX_DETAIL_PAGES_PER_SOURCE = 500
+MAX_PAGES_PER_SOURCE = 1000
+MAX_DETAIL_PAGES_PER_SOURCE = 750
 MAX_OSM_ELEMENTS_PER_QUERY = 5000
-ENABLE_BROWSER_FALLBACK = os.getenv("ENABLE_BROWSER_FALLBACK", "0") == "1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36"
 
 SOURCE_NAMES = [
@@ -33,8 +27,6 @@ SOURCE_NAMES = [
     "OpenStreetMap"
 ]
 
-# Search expansion matters: a selected region is not a single city. Western Uganda,
-# for example, is searched through its major districts/cities rather than one Kampala bbox.
 REGION_CITIES = {
     "Kampala": ["kampala"],
     "Wakiso": ["wakiso", "kira", "nansana", "entebbe", "kajjansi", "kasangati", "gayaza", "bweyogerere"],
@@ -68,7 +60,7 @@ REGION_DISTRICTS = {
 }
 
 REGION_ALIASES = {
-    "Kampala": REGION_CITIES["Kampala"] + ["central division", "kawempe", "nakawa", "makindye", "rubaga", "lubaga", "ntinda", "kololo", "bukoto", "muyenga", "kabalagala"],
+    "Kampala": REGION_CITIES["Kampala"] + ["central division", "kawempe", "nakawa", "makindye", "rubaga", "lubaga", "ntinda", "kololo", "bukoto", "muyenga", "kabalagala", "kampala city"],
     "Wakiso": REGION_CITIES["Wakiso"] + ["wakiso district", "kyaliwajjala", "buloba", "busabala", "zanna", "lubowa"],
     "Mukono": REGION_CITIES["Mukono"] + ["mukono district", "sonde", "namanve", "nakisunga"],
     "Masaka": REGION_CITIES["Masaka"] + ["masaka district", "bukakata", "kijjabwemi"],
@@ -76,8 +68,6 @@ REGION_ALIASES = {
     "Western Uganda": REGION_CITIES["Western Uganda"] + ["western uganda", "western region", "western"],
 }
 
-# Major Western Uganda search areas. OSM is not a registry; this is deliberately a
-# multi-area discovery layer rather than pretending one box covers all Western Uganda.
 REGION_BBOXES = {
     "Kampala": ["0.25,32.45,0.42,32.70"],
     "Wakiso": ["0.05,32.25,0.60,32.80"],
@@ -85,12 +75,9 @@ REGION_BBOXES = {
     "Masaka": ["-0.50,31.55,-0.15,31.90"],
     "Jinja": ["0.30,33.05,0.60,33.45"],
     "Western Uganda": [
-        "-0.80,30.40,-0.45,31.00",   # Mbarara / Ntungamo / Bushenyi corridor
-        "0.45,29.95,0.80,30.45",      # Fort Portal / Kyenjojo
-        "-0.45,29.75,-0.10,30.30",    # Kabale / Kisoro / Rukungiri
-        "-0.10,29.75,0.30,30.35",     # Kasese / Rubirizi
-        "0.70,30.00,1.30,31.20",      # Hoima / Kibaale / Kagadi
-        "0.05,30.75,0.45,31.45",      # Masindi / Buliisa side
+        "-0.80,30.40,-0.45,31.00", "0.45,29.95,0.80,30.45",
+        "-0.45,29.75,-0.10,30.30", "-0.10,29.75,0.30,30.35",
+        "0.70,30.00,1.30,31.20", "0.05,30.75,0.45,31.45",
     ],
 }
 
@@ -103,31 +90,10 @@ session = requests.Session()
 session.headers.update({
     "User-Agent": USER_AGENT,
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.8,*/*;q=0.5",
 })
 
-_BROWSER_LOCAL = threading.local()
-
-def browser_html(url):
-    """Headless-browser fallback for JS/challenge pages; used only when direct HTTP fails."""
-    if sync_playwright is None:
-        return None, url
-    try:
-        state=getattr(_BROWSER_LOCAL,"state",None)
-        if state is None:
-            pw=sync_playwright().start()
-            executable="/usr/bin/chromium" if os.path.exists("/usr/bin/chromium") else None
-            browser=pw.chromium.launch(headless=True, executable_path=executable) if executable else pw.chromium.launch(headless=True)
-            page=browser.new_page(user_agent=USER_AGENT)
-            _BROWSER_LOCAL.state=(pw,browser,page)
-            state=_BROWSER_LOCAL.state
-        page=state[2]
-        page.goto(url,wait_until="domcontentloaded",timeout=BROWSER_TIMEOUT)
-        page.wait_for_timeout(350)
-        return page.content(), page.url
-    except Exception:
-        return None, url
-
+# ---------- text / validation ----------
 
 def clean_text(v):
     if v is None:
@@ -157,23 +123,58 @@ def unique_join(values):
     return " | ".join(out) if out else "N/A"
 
 
+BAD_NAMES = {
+    "n/a", "na", "home", "contact", "contact us", "about", "about us", "login", "register",
+    "search", "categories", "category", "read more", "details", "view profile", "send enquiry",
+    "send inquiry", "website", "facebook", "twitter", "instagram", "linkedin", "no reviews",
+    "write a review", "favorite", "map", "get directions", "with 0 comments", "with 0 comment",
+}
+
+BAD_NAME_PATTERNS = [
+    r"^with\s+\d+\s+comments?$",
+    r"^\d+\s+reviews?$",
+    r"^page\s+\d+$",
+    r"^top\s+\d+",
+    r"^view\s+profile$",
+    r"^send\s+enquir",
+    r"^search\s+results?$",
+]
+
+
+def valid_business_name(name, keyword=""):
+    n = clean_text(name)
+    low = n.lower().strip()
+    if low in BAD_NAMES or low == "n/a":
+        return False
+    if any(re.search(p, low, re.I) for p in BAD_NAME_PATTERNS):
+        return False
+    if len(n) < 2 or len(n) > 220:
+        return False
+    # Reject obvious UI/category headings.
+    if re.fullmatch(r"[\W_\d]+", n):
+        return False
+    if low in {"hardware stores", "hardware", "construction", "building materials", "manufacturing", "store"}:
+        return False
+    return True
+
+
 def phones_from(text):
     if not text or clean_text(text) == "N/A":
         return []
     t = str(text)
     patterns = [
         r"\+256\s*(?:\(?\d{2,3}\)?)[\s./-]*\d{3,4}[\s./-]*\d{3,4}",
-        r"0\s*\d{2,3}[\s./-]*\d{3,4}[\s./-]*\d{3,4}",
-        r"\b04\s*\d{2,3}[\s./-]*\d{3,4}[\s./-]*\d{3,4}\b",
+        r"\(?0\d{2,3}\)?[\s./-]*\d{3,4}[\s./-]*\d{3,4}",
+        r"\b0?4\d{2}[\s./-]*\d{3,4}[\s./-]*\d{2,4}\b",
     ]
     found = []
     for p in patterns:
         for m in re.finditer(p, t):
-            raw = re.sub(r"\s+", " ", m.group(0)).strip(" -|,")
+            raw = re.sub(r"\s+", " ", m.group(0)).strip(" -|,.;")
             digits = re.sub(r"\D", "", raw)
-            if digits.startswith("256") and len(digits) in range(10, 13):
+            if digits.startswith("256") and 10 <= len(digits) <= 12:
                 val = "+" + digits
-            elif digits.startswith("0") and len(digits) in range(9, 11):
+            elif digits.startswith("0") and 9 <= len(digits) <= 10:
                 val = digits
             else:
                 val = raw
@@ -196,41 +197,93 @@ def email_from(text):
     return " | ".join(vals) if vals else "N/A"
 
 
-def address_from_text(text):
-    t = clean_text(text)
-    labels = r"(?:Address|Location|Physical Address|Plot|P\.O\. Box|Contacts?|Phone|Email|Website|Category|Listing Description)"
-    m = re.search(rf"(?:Address|Physical Address)\s*:\s*(.*?)(?=\s+{labels}\s*:|$)", t, re.I)
-    if m and clean_text(m.group(1)) != "N/A":
-        return clean_text(m.group(1))
-    return "N/A"
-
-
 def labeled(text, label):
     t = clean_text(text)
-    labels = ["Address", "Physical Address", "Location", "Phone", "Contacts", "Email", "Website", "Category", "Listing Description", "Description", "Overview"]
+    labels = ["Address", "Physical Address", "Location", "Phone", "Contact number", "Contacts", "Email", "E-mail address", "Website", "Website address", "Category", "Listed in categories", "Listing Description", "Description", "Overview", "Company name", "Business name"]
     stops = [x for x in labels if x.lower() != label.lower()]
     stop = "|".join(re.escape(x) for x in stops)
-    m = re.search(rf"{re.escape(label)}\s*:\s*(.*?)(?=\s+(?:{stop})\s*:|$)", t, re.I)
+    m = re.search(rf"{re.escape(label)}\s*:?\s*(.*?)(?=\s+(?:{stop})\s*:|$)", t, re.I)
     return clean_text(m.group(1)) if m else "N/A"
 
 
-def make_record(name, region, keyword, source, url, phone="N/A", website="N/A", address="N/A", category="N/A", deals="N/A", email="N/A", rating="N/A", lat="N/A", lng="N/A", district="N/A"):
+def address_from_text(text):
+    for label in ["Address", "Physical Address", "Location"]:
+        value = labeled(text, label)
+        if value != "N/A" and len(value) >= 4:
+            return value
+    patterns = [
+        r"Plot\s+[^|]{4,180}",
+        r"P\.O\.\s*Box\s+[^|]{3,100}",
+        r"[^|]{3,120}\s+Road,?\s+[^|]{2,100}(?:Kampala|Jinja|Wakiso|Mukono|Mbarara|Uganda)[^|]{0,100}",
+    ]
+    t = clean_text(text)
+    for p in patterns:
+        m = re.search(p, t, re.I)
+        if m:
+            return clean_text(m.group(0))
+    return "N/A"
+
+
+# ---------- Business Deals In: one short activity ----------
+GENERIC_ACTIVITY = {
+    "store", "stores", "shop", "shops", "ltd", "limited", "company", "co", "factory",
+    "factories", "manufacturing", "manufacturer", "manufacturers", "supplier", "suppliers",
+    "trader", "traders", "trading", "enterprise", "enterprises", "business", "businesses",
+    "services", "service", "group", "uganda", "ug", "general", "dealers", "dealer",
+}
+
+ACTIVITY_RULES = [
+    (r"\b(building|construction|builder|builders|building materials|civil works)\b", "Construction"),
+    (r"\b(plumb|pipes?|sanitary ware|bathroom fittings?)\b", "Plumbing"),
+    (r"\b(electrical|electrician|wiring|solar|power equipment)\b", "Electrical"),
+    (r"\b(roofing|roof|roof sheets?|tiles?\s+and\s+roof)\b", "Roofing"),
+    (r"\b(furniture|sofa|chairs?|beds?|cabinet|joinery)\b", "Furniture"),
+    (r"\b(steel|metal|metalwork|fabrication|iron)\b", "Steel"),
+    (r"\b(paint|paints|decorating|decoration)\b", "Paint"),
+    (r"\b(timber|wood|lumber|sawmill)\b", "Timber"),
+    (r"\b(tools?|fasteners?|bolts?|nuts?|hardware)\b", "Hardware"),
+    (r"\b(auto|automotive|garage|vehicle|motor|spares?|car parts?)\b", "Automotive"),
+    (r"\b(pharmacy|pharmaceutical|drugs?|medical supplies?)\b", "Pharmaceuticals"),
+    (r"\b(food|foods?|bakery|baking|beverages?|drinks?|restaurant|catering)\b", "Food"),
+    (r"\b(hotel|lodg(e|ing)|accommodation|guest house|resort)\b", "Hospitality"),
+    (r"\b(school|education|college|university|training)\b", "Education"),
+    (r"\b(furniture|interior design)\b", "Furniture"),
+    (r"\b(agro|agriculture|farm|seeds?|fertilizer|agrovet)\b", "Agriculture"),
+    (r"\b(telecom|telecommunications|mobile money|internet|ict|software|computer)\b", "Technology"),
+    (r"\b(logistics|transport|trucking|courier|freight)\b", "Transport"),
+    (r"\b(insurance|insurer)\b", "Insurance"),
+    (r"\b(bank|microfinance|finance|financial)\b", "Finance"),
+]
+
+
+def short_activity(keyword, category="N/A", description="", name=""):
+    texts = [clean_text(description), clean_text(category), clean_text(name)]
+    combined = " ".join(x for x in texts if x != "N/A").lower()
+    for pattern, label in ACTIVITY_RULES:
+        if re.search(pattern, combined, re.I):
+            return label
+    # A specific category is better than a generic directory label.
+    c = norm(category)
+    if c and c not in {"n a", "hardware stores", "store", "stores", "shop", "general"}:
+        words = [w for w in c.split() if w not in GENERIC_ACTIVITY]
+        if words:
+            return words[0].capitalize()
+    # For broad searches, use the keyword only as the final fallback.
+    kwords = [w for w in norm(keyword).split() if w not in GENERIC_ACTIVITY]
+    if kwords:
+        return " ".join(w.capitalize() for w in kwords[:2])
+    # Generic search like Store/Ltd/Factory has no inferable activity.
+    return clean_text(keyword).title() if clean_text(keyword) != "N/A" else "N/A"
+
+
+def make_record(name, region, keyword, source, url, phone="N/A", website="N/A", address="N/A", category="N/A", deals="N/A", email="N/A", rating="N/A", lat="N/A", lng="N/A", district="N/A", description="N/A"):
+    activity = short_activity(keyword, category, description if description != "N/A" else deals, name)
     return {
-        "Company Name": clean_text(name),
-        "Region": region,
-        "Search Query": clean_text(keyword),
-        "Category": clean_text(category),
-        "Business Deals In": clean_text(deals),
-        "Phone Contact": clean_text(phone),
-        "Email": clean_text(email),
-        "Website": clean_text(website),
-        "Physical Address": clean_text(address),
-        "District": clean_text(district),
-        "Rating": clean_text(rating),
-        "Lat": clean_text(lat),
-        "Lng": clean_text(lng),
-        "Data Source": source,
-        "Source URL": url,
+        "Company Name": clean_text(name), "Region": region, "Search Query": clean_text(keyword),
+        "Category": clean_text(category), "Business Deals In": activity,
+        "Phone Contact": clean_text(phone), "Email": clean_text(email), "Website": clean_text(website),
+        "Physical Address": clean_text(address), "District": clean_text(district), "Rating": clean_text(rating),
+        "Lat": clean_text(lat), "Lng": clean_text(lng), "Data Source": source, "Source URL": url,
     }
 
 
@@ -247,18 +300,19 @@ def keyword_match(record, keyword):
     if not q:
         return True
     hay = norm(" ".join([
-        record.get("Company Name", ""), record.get("Category", ""),
-        record.get("Business Deals In", ""), record.get("Physical Address", ""),
-        record.get("Source URL", "")
+        record.get("Company Name", ""), record.get("Category", ""), record.get("Business Deals In", ""),
+        record.get("Physical Address", ""), record.get("Source URL", "")
     ]))
-    # Match the complete phrase OR at least one meaningful token. This is intentional:
-    # "building materials" can be indexed as "hardware" or vice versa on directories.
     if q in hay:
         return True
-    tokens = [x for x in q.split() if len(x) > 2]
-    return bool(tokens) and any(x in hay for x in tokens)
+    tokens = [x for x in q.split() if len(x) > 2 and x not in GENERIC_ACTIVITY]
+    if not tokens:
+        # Generic searches such as "store", "ltd", "factory" are intentionally broad.
+        return True
+    return any(x in hay for x in tokens)
 
 
+# ---------- HTTP ----------
 def http_html(url):
     try:
         r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
@@ -266,11 +320,6 @@ def http_html(url):
             return r.text, r.url
     except requests.RequestException:
         pass
-    # Browser rendering is deliberately opt-in on Community Cloud because Chromium
-    # can consume hundreds of MB of RAM and cause the whole Streamlit process to be
-    # killed during a broad Western Uganda search.
-    if ENABLE_BROWSER_FALLBACK:
-        return browser_html(url)
     return None, url
 
 
@@ -282,562 +331,554 @@ def extract_jsonld(soup):
     rows = []
     for s in soup.find_all("script", type="application/ld+json"):
         try:
-            import json
             data = json.loads(s.string or s.get_text())
-            if isinstance(data, list): rows.extend(data)
-            else: rows.append(data)
+            rows.extend(data if isinstance(data, list) else [data])
         except Exception:
             continue
     return rows
 
 
+def jsonld_items(soup):
+    for obj in extract_jsonld(soup):
+        if not isinstance(obj, dict):
+            continue
+        yield obj
+        graph = obj.get("@graph")
+        if isinstance(graph, list):
+            for item in graph:
+                if isinstance(item, dict):
+                    yield item
+
+
+def profile_name(soup, url):
+    # Structured business name first.
+    for item in jsonld_items(soup):
+        typ = str(item.get("@type", "")).lower()
+        if item.get("name") and (typ in {"organization", "localbusiness", "corporation", "store", "place"} or "business" in typ):
+            n = clean_text(item.get("name"))
+            if valid_business_name(n):
+                return n
+    # Directory profile pages normally expose the business name in h1.
+    for tag in soup.find_all(["h1", "h2"]):
+        n = clean_text(tag.get_text(" ", strip=True))
+        if valid_business_name(n):
+            # Strip common location suffixes from titles/headings.
+            n = re.sub(r"\s*[-–—]\s*(Kampala|Jinja|Wakiso|Mukono|Mbarara|Uganda).*?$", "", n, flags=re.I).strip()
+            if valid_business_name(n):
+                return n
+    text = clean_text(soup.get_text(" ", strip=True))
+    for label in ["Company name", "Business name"]:
+        n = labeled(text, label)
+        if valid_business_name(n):
+            return n
+    title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    if title:
+        n = re.split(r"\s+[-|]\s+", title, maxsplit=1)[0].strip()
+        if valid_business_name(n):
+            return n
+    return "N/A"
+
+
 def detail_enrich(url, page_cache, deadline):
     if time.monotonic() >= deadline or not url or url in page_cache:
         return page_cache.get(url, {})
+    if sum(1 for v in page_cache.values() if v) >= MAX_DETAIL_PAGES_PER_SOURCE:
+        return {}
     html, final_url = http_html(url)
     if not html:
         page_cache[url] = {}
         return {}
     soup = soup_from(html)
     text = clean_text(soup.get_text(" ", strip=True))
-    phones = phones_from(text)
-    emails = emails_from(text)
-    address = address_from_text(text)
-    website = "N/A"
-    category = "N/A"
-    deals = "N/A"
-    # Prefer structured LocalBusiness/Organization data when a directory publishes it.
-    for obj in extract_jsonld(soup):
-        if not isinstance(obj, dict):
-            continue
-        items = [obj] + [x for x in obj.get("@graph", []) if isinstance(x, dict)] if isinstance(obj.get("@graph"), list) else [obj]
-        for item in items:
-            if item.get("telephone"): phones.extend(phones_from(item.get("telephone")))
-            if item.get("email"): emails.extend(emails_from(item.get("email")))
-            if address == "N/A" and isinstance(item.get("address"), dict):
-                ad=item.get("address", {})
-                address=clean_text(", ".join(str(ad.get(k)) for k in ["streetAddress","addressLocality","addressRegion","postalCode","addressCountry"] if ad.get(k)))
-            if website == "N/A" and item.get("url"):
-                website=clean_text(item.get("url"))
-            if category == "N/A" and item.get("category"):
-                category=clean_text(item.get("category"))
-            if deals == "N/A" and item.get("description"):
-                deals=clean_text(item.get("description"))
+    phones, emails = phones_from(text), emails_from(text)
+    address, website, category, description = address_from_text(text), "N/A", "N/A", "N/A"
+    name = profile_name(soup, final_url)
+    rating = "N/A"
+    for item in jsonld_items(soup):
+        if item.get("telephone"): phones.extend(phones_from(item.get("telephone")))
+        if item.get("email"): emails.extend(emails_from(item.get("email")))
+        if address == "N/A" and isinstance(item.get("address"), dict):
+            ad = item["address"]
+            address = clean_text(", ".join(str(ad.get(k)) for k in ["streetAddress", "addressLocality", "addressRegion", "postalCode", "addressCountry"] if ad.get(k)))
+        if website == "N/A" and item.get("url"):
+            website = clean_text(item.get("url"))
+        if category == "N/A" and item.get("category"):
+            category = clean_text(item.get("category"))
+        if description == "N/A" and item.get("description"):
+            description = clean_text(item.get("description"))
+        if rating == "N/A" and isinstance(item.get("aggregateRating"), dict):
+            rating = clean_text(item["aggregateRating"].get("ratingValue"))
     for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
+        href = urllib.parse.urljoin(final_url, a.get("href", ""))
+        label = clean_text(a.get_text(" ", strip=True)).lower()
         if href.startswith("tel:"):
             phones.extend(phones_from(urllib.parse.unquote(href[4:])))
-        if href.startswith("mailto:"):
+        elif href.startswith("mailto:"):
             emails.extend(emails_from(urllib.parse.unquote(href[7:])))
-        if href.startswith("http") and not any(x in href.lower() for x in ["yellow.ug", "find.ug", "hotfrog", "finderafrica", "yellowpages-uganda"]):
-            if clean_text(a.get_text(" ", strip=True)).lower() in {"website", "visit website", "web site"}:
-                website = href
-                break
-    if category == "N/A": category = labeled(text, "Category")
-    if deals == "N/A": deals = labeled(text, "Listing Description")
-    if deals == "N/A": deals = labeled(text, "Description")
-    if deals == "N/A": deals = labeled(text, "Overview")
+        elif href.startswith("http") and label in {"website", "visit website", "web site"}:
+            website = href
+    if category == "N/A":
+        category = labeled(text, "Category")
+        if category == "N/A":
+            category = labeled(text, "Listed in categories")
+    for label in ["Listing Description", "Description", "Overview", "Company description"]:
+        if description == "N/A":
+            description = labeled(text, label)
     if address == "N/A":
-        # Common Uganda directory address forms when no explicit "Address:" label exists.
-        candidates = re.findall(r"(?:Plot\s+[^|]{4,160}|P\.O\.\s*Box\s+[^|]{3,80}|[A-Za-z0-9 .'-]+\s+Road,?\s+(?:Kampala|Jinja|Wakiso|Mukono|Mbarara|Uganda)[^|]{0,100})", text, re.I)
+        candidates = re.findall(r"(?:Plot\s+[^|]{4,180}|P\.O\.\s*Box\s+[^|]{3,100})", text, re.I)
         if candidates:
-            address=clean_text(candidates[0])
+            address = clean_text(candidates[0])
     page_cache[url] = {
-        "phone": phone_from(" | ".join(phones)),
-        "email": email_from(" | ".join(emails)),
-        "address": address,
-        "website": website,
-        "category": category,
-        "deals": deals,
-        "url": final_url,
+        "name": name, "phone": phone_from(" | ".join(phones)), "email": email_from(" | ".join(emails)),
+        "address": address, "website": website, "category": category, "description": description,
+        "rating": rating, "url": final_url,
     }
     return page_cache[url]
 
 
 def listing_link_candidates(soup, base, markers):
-    out=[]; seen=set()
+    out, seen = [], set()
     for a in soup.find_all("a", href=True):
-        href=urllib.parse.urljoin(base,a.get("href",""))
-        text=clean_text(a.get_text(" ",strip=True))
-        low=href.lower()
-        if any(m in low for m in markers) and len(text)>2 and href not in seen:
-            seen.add(href); out.append((href,a))
+        href = urllib.parse.urljoin(base, a.get("href", ""))
+        text = clean_text(a.get_text(" ", strip=True))
+        low = href.lower()
+        if not any(m in low for m in markers):
+            continue
+        if href in seen or href.rstrip("/") == base.rstrip("/"):
+            continue
+        seen.add(href)
+        out.append((href, a, text))
     return out
 
 
-def parse_card(a, region, keyword, source, base, page_cache, deadline):
-    node=a
-    best=None
-    for _ in range(8):
-        node=getattr(node,"parent",None)
-        if not node: break
-        txt=clean_text(node.get_text(" ",strip=True))
-        if len(txt)>len(clean_text(a.get_text(" ",strip=True))) and len(txt)<3500:
-            if any(x in txt.lower() for x in ["address", "phone", "contacts", "category", "listing description", "overview"]):
-                best=node; break
-    card=best or a.parent
-    text=clean_text(card.get_text(" ",strip=True))
-    name=clean_text(a.get_text(" ",strip=True))
-    address=address_from_text(text)
-    phone=phone_from(text)
-    email=email_from(text)
-    category=labeled(text,"Category")
-    deals=labeled(text,"Listing Description")
-    if deals=="N/A": deals=labeled(text,"Description")
-    if deals=="N/A": deals=labeled(text,"Overview")
-    website="N/A"
-    for x in card.find_all("a",href=True):
-        h=x.get("href","")
-        if h.startswith("tel:"): phone=unique_join([phone,phone_from(urllib.parse.unquote(h[4:]))])
-        if h.startswith("mailto:"): email=unique_join([email,email_from(urllib.parse.unquote(h[7:]))])
-        if h.startswith("http") and clean_text(x.get_text(" ",strip=True)).lower() in {"website","visit website","web site"}:
-            website=h
-    if (phone=="N/A" or address=="N/A" or deals=="N/A") and time.monotonic()<deadline:
-        d=detail_enrich(base if "/company/" in base else base, page_cache, deadline)
-    else:
-        d={}
-    # In normal calls, base is the detail URL. The source parsers pass that explicitly.
-    phone=unique_join([phone,d.get("phone")])
-    email=unique_join([email,d.get("email")])
-    address=d.get("address") if address=="N/A" else address
-    website=d.get("website") if website=="N/A" else website
-    category=d.get("category") if category=="N/A" else category
-    deals=d.get("deals") if deals=="N/A" else deals
-    return make_record(name,region,keyword,source,base,phone,website,address,category,deals,email)
-
-
-def next_page(soup,current):
-    for a in soup.find_all("a",href=True):
-        txt=norm(a.get_text(" ",strip=True))
-        rel=" ".join(a.get("rel",[])).lower()
-        if txt in {"next","next page",">","→","older posts"} or "next" in rel:
-            return urllib.parse.urljoin(current,a["href"])
+def next_page(soup, current):
+    for a in soup.find_all("a", href=True):
+        txt = norm(a.get_text(" ", strip=True))
+        rel = " ".join(a.get("rel", [])).lower()
+        if txt in {"next", "next page", ">", "→", "older posts"} or "next" in rel:
+            return urllib.parse.urljoin(current, a["href"])
     return None
 
 
-def parse_yellow_page(soup, region, keyword, url, source="Yellow Uganda"):
-    recs=[]
-    links=listing_link_candidates(soup,url,["/company/"])
-    for href,a in links[:MAX_RECORDS_PER_SOURCE]:
-        card=a
-        for _ in range(6):
-            if not card.parent: break
-            card=card.parent
-            txt=clean_text(card.get_text(" ",strip=True))
-            if len(txt)<2500 and ("address" in txt.lower() or "phone" in txt.lower()): break
-        text=clean_text(card.get_text(" ",strip=True))
-        name=clean_text(a.get_text(" ",strip=True))
-        address=labeled(text,"Address")
-        if address=="N/A": address=address_from_text(text)
-        phone=phone_from(text)
-        email=email_from(text)
-        category=labeled(text,"Category")
-        deals=labeled(text,"Listing Description")
-        if deals=="N/A": deals=labeled(text,"Description")
-        recs.append(make_record(name,region,keyword,source,href,phone,"N/A",address,category,deals,email))
-    return recs
+def build_record_from_profile(href, anchor_text, region, keyword, source, page_cache, deadline, card_text=""):
+    # If the anchor itself is clearly a real business name, keep it initially.
+    name = anchor_text if valid_business_name(anchor_text, keyword) else "N/A"
+    phone = phone_from(card_text)
+    email = email_from(card_text)
+    address = address_from_text(card_text)
+    category = labeled(card_text, "Category")
+    deals_text = labeled(card_text, "Listing Description")
+    if deals_text == "N/A": deals_text = labeled(card_text, "Description")
+    d = {}
+    # Always enrich when the name is invalid; otherwise enrich only when useful fields are missing.
+    if name == "N/A" or phone == "N/A" or address == "N/A" or deals_text == "N/A":
+        d = detail_enrich(href, page_cache, deadline)
+    if name == "N/A": name = d.get("name", "N/A")
+    if phone == "N/A": phone = d.get("phone", "N/A")
+    else: phone = unique_join([phone, d.get("phone", "N/A")])
+    email = unique_join([email, d.get("email", "N/A")])
+    if address == "N/A": address = d.get("address", "N/A")
+    if category == "N/A": category = d.get("category", "N/A")
+    if deals_text == "N/A": deals_text = d.get("description", "N/A")
+    website = d.get("website", "N/A")
+    rating = d.get("rating", "N/A")
+    if not valid_business_name(name, keyword):
+        return None
+    return make_record(name, region, keyword, source, d.get("url", href), phone, website, address, category, deals_text, email, rating, description=deals_text)
 
 
-def yellow_category_candidates(region, keyword, page_cache, deadline):
-    candidates=[]
-    cities=REGION_CITIES.get(region,[slug(region)])
-    q=norm(keyword)
+# ---------- Yellow Uganda ----------
+def yellow_category_candidates(region, keyword, deadline):
+    cities = REGION_CITIES.get(region, [slug(region)])
+    q = norm(keyword)
+    found = []
 
     def inspect_city(city):
-        if time.monotonic()>=deadline: return []
-        u=f"https://www.yellow.ug/location/{slug(city)}/list%3Acategories"
-        html,final=http_html(u)
-        if not html: return []
-        soup=soup_from(html); found=[]
-        for a in soup.find_all("a",href=True):
-            h=urllib.parse.urljoin(final,a["href"]); txt=norm(a.get_text(" ",strip=True))
-            if "/category/" not in h.lower(): continue
-            score=5 if q and q in txt else (3 if q and any(t in txt for t in q.split() if len(t)>2) else 0)
-            if score: found.append((score,h))
-        return found
+        if time.monotonic() >= deadline:
+            return []
+        u = f"https://www.yellow.ug/location/{slug(city)}/list%3Acategories"
+        html, final = http_html(u)
+        if not html:
+            return []
+        soup = soup_from(html)
+        local = []
+        for a in soup.find_all("a", href=True):
+            h = urllib.parse.urljoin(final, a["href"])
+            txt = norm(a.get_text(" ", strip=True))
+            if "/category/" not in h.lower():
+                continue
+            # Exact query, meaningful token, or closely related construction/hardware terms.
+            score = 5 if q and q in txt else 0
+            if not score and q:
+                tokens = [x for x in q.split() if len(x) > 2 and x not in GENERIC_ACTIVITY]
+                score = 3 if any(t in txt for t in tokens) else 0
+            related = {"hardware": ["hardware stores", "building materials", "construction", "tools", "plumbing", "roofing"],
+                       "store": ["stores", "shopping", "retail"],
+                       "manufacturing": ["manufacturing", "industrial"],
+                       "factory": ["manufacturing", "industrial"],
+                       "ltd": []}.get(q, [])
+            if not score and any(r in txt for r in related):
+                score = 2
+            if score:
+                local.append((score, h))
+        return local
 
-    # Category indexes are independent. Parallel discovery prevents Western Uganda's
-    # many towns from consuming the whole Yellow Uganda source time slice.
-    workers=min(4,max(1,len(cities)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures=[ex.submit(inspect_city,c) for c in cities]
+    # Discovery is parallel but only for small category-index pages; business-page crawling is sequential.
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(cities)))) as ex:
+        futures = [ex.submit(inspect_city, c) for c in cities]
         for fut in as_completed(futures):
-            try: candidates.extend(fut.result())
-            except Exception: pass
-            if time.monotonic()>=deadline: break
-    direct=[]
-    for city in cities:
-        direct.append(f"https://www.yellow.ug/category/{slug(keyword)}/city%3A{slug(city)}")
+            try:
+                found.extend(fut.result())
+            except Exception:
+                pass
+    direct = [f"https://www.yellow.ug/category/{slug(keyword)}/city%3A{slug(c)}" for c in cities]
     direct.append(f"https://www.yellow.ug/category/{slug(keyword)}")
-    seen=set(); out=[]
-    for _,u in sorted(candidates,key=lambda x:-x[0])+[(1,x) for x in direct]:
+    seen, out = set(), []
+    for _, u in sorted(found, key=lambda x: -x[0]) + [(1, x) for x in direct]:
         if u not in seen:
             seen.add(u); out.append(u)
-    return out[:20]
+    return out
 
 
-def scrape_yellow(region,keyword,deadline):
-    out=[]; seen=set(); details={}
-    starts=yellow_category_candidates(region,keyword,details,deadline)
+def scrape_yellow(region, keyword, deadline):
+    out, seen_pages, seen_profiles, details = [], set(), set(), {}
+    starts = yellow_category_candidates(region, keyword, deadline)
     for start in starts:
-        url=start; pages=0
-        while url and pages<MAX_PAGES_PER_SOURCE and time.monotonic()<deadline and len(out)<MAX_RECORDS_PER_SOURCE:
-            if url in seen: break
-            seen.add(url); pages+=1
-            html,final=http_html(url)
-            if not html: break
-            soup=soup_from(html)
-            links=listing_link_candidates(soup,final,["/company/"])
-            for href,a in links:
-                if len(out)>=MAX_RECORDS_PER_SOURCE: break
-                # Parse card first; enrich missing contacts/address from the actual profile URL.
-                card=a
-                for _ in range(7):
-                    if not card.parent: break
-                    card=card.parent
-                    txt=clean_text(card.get_text(" ",strip=True))
-                    if len(txt)<3000 and any(k in txt.lower() for k in ["address","phone","category"]): break
-                text=clean_text(card.get_text(" ",strip=True))
-                name=clean_text(a.get_text(" ",strip=True))
-                address=labeled(text,"Address")
-                phone=phone_from(text)
-                email=email_from(text)
-                category=labeled(text,"Category")
-                deals=labeled(text,"Listing Description")
-                if deals=="N/A": deals=labeled(text,"Description")
-                if phone=="N/A" or address=="N/A" or deals=="N/A":
-                    d=detail_enrich(href,details,deadline)
-                    phone=unique_join([phone,d.get("phone")]); email=unique_join([email,d.get("email")])
-                    if address=="N/A": address=d.get("address","N/A")
-                    if category=="N/A": category=d.get("category","N/A")
-                    if deals=="N/A": deals=d.get("deals","N/A")
-                    website=d.get("website","N/A")
-                else: website="N/A"
-                out.append(make_record(name,region,keyword,"Yellow Uganda",href,phone,website,address,category,deals,email))
-            nxt=next_page(soup,final)
-            if nxt and nxt!=url: url=nxt
+        url = start
+        pages = 0
+        while url and pages < MAX_PAGES_PER_SOURCE and time.monotonic() < deadline and len(out) < MAX_RECORDS_PER_SOURCE:
+            if url in seen_pages:
+                break
+            seen_pages.add(url); pages += 1
+            html, final = http_html(url)
+            if not html:
+                break
+            soup = soup_from(html)
+            links = listing_link_candidates(soup, final, ["/company/"])
+            for href, a, anchor_text in links:
+                if href in seen_profiles:
+                    continue
+                seen_profiles.add(href)
+                card = a.parent
+                for _ in range(8):
+                    if not getattr(card, "parent", None): break
+                    txt = clean_text(card.get_text(" ", strip=True))
+                    if len(txt) <= 3500 and any(k in txt.lower() for k in ["address", "phone", "contact number", "view profile"]):
+                        break
+                    card = card.parent
+                card_text = clean_text(card.get_text(" ", strip=True))
+                rec = build_record_from_profile(href, anchor_text, region, keyword, "Yellow Uganda", details, deadline, card_text)
+                page_scoped = norm(keyword) in norm(final) or slug(keyword) in norm(final)
+                if rec and (keyword_match(rec, keyword) or page_scoped or norm(keyword) in norm(card_text)):
+                    out.append(rec)
+                if len(out) >= MAX_RECORDS_PER_SOURCE:
+                    break
+            nxt = next_page(soup, final)
+            if nxt and nxt not in seen_pages:
+                url = nxt
             else:
-                # Yellow often uses explicit numbered pagination; find a higher page link.
-                nums=[]
-                for a in soup.find_all("a",href=True):
-                    h=urllib.parse.urljoin(final,a["href"])
-                    m=re.search(r"/(\d+)(?:/)?(?:\?|$)",h)
-                    if "/category/" in h and m: nums.append((int(m.group(1)),h))
-                bigger=[h for n,h in nums if n>pages]
-                url=min(bigger,key=lambda h:int(re.search(r"/(\d+)(?:/)?(?:\?|$)",h).group(1))) if bigger else None
+                # Yellow Uganda's category pagination is /category/slug/N/city%3Acity.
+                nums = []
+                for a in soup.find_all("a", href=True):
+                    h = urllib.parse.urljoin(final, a["href"])
+                    m = re.search(r"/category/[^/]+/(\d+)/city%3A", h, re.I)
+                    if m:
+                        nums.append((int(m.group(1)), h))
+                bigger = [(n, h) for n, h in nums if n > pages]
+                url = min(bigger, key=lambda x: x[0])[1] if bigger else None
     return out
 
 
-def generic_directory_crawl(start_urls, region, keyword, source, markers, deadline, detail_markers=True):
-    out=[]; seen_pages=set(); seen_records=set(); details={}
-    queue=list(start_urls)
-    while queue and len(out)<MAX_RECORDS_PER_SOURCE and time.monotonic()<deadline and len(seen_pages)<MAX_PAGES_PER_SOURCE:
-        url=queue.pop(0)
-        if url in seen_pages: continue
+# ---------- Other directories ----------
+def generic_directory_crawl(start_urls, region, keyword, source, markers, deadline, detail_markers=True, exclude_patterns=None):
+    out, seen_pages, seen_records, details = [], set(), set(), {}
+    queue = list(start_urls)
+    exclude_patterns = exclude_patterns or ["/category/", "/tags/", "/page/"]
+    while queue and len(out) < MAX_RECORDS_PER_SOURCE and time.monotonic() < deadline and len(seen_pages) < MAX_PAGES_PER_SOURCE:
+        url = queue.pop(0)
+        if url in seen_pages:
+            continue
         seen_pages.add(url)
-        html,final=http_html(url)
-        if not html: continue
-        soup=soup_from(html)
-        links=listing_link_candidates(soup,final,markers)
-        for href,a in links:
-            if len(out)>=MAX_RECORDS_PER_SOURCE: break
-            if href in seen_records: continue
-            low_href=href.lower()
-            # Do not mistake category/tag/pagination pages for individual businesses.
-            if any(x in low_href for x in ["/listings/category/", "/listings/tags/", "/listings/page/", "/listing-category/", "/category/"]):
+        html, final = http_html(url)
+        if not html:
+            continue
+        soup = soup_from(html)
+        for href, a, anchor_text in listing_link_candidates(soup, final, markers):
+            if len(out) >= MAX_RECORDS_PER_SOURCE or href in seen_records:
                 continue
-            name=clean_text(a.get_text(" ",strip=True))
-            if name.lower() in {"view profile","read more","details","home","contact","about us"}: continue
-            # Build record directly from the listing card.
-            card=a
-            for _ in range(7):
-                if not card.parent: break
-                card=card.parent
-                txt=clean_text(card.get_text(" ",strip=True))
-                if len(txt)<3500 and any(k in txt.lower() for k in ["address","phone","contacts","category","overview"]): break
-            text=clean_text(card.get_text(" ",strip=True))
-            address=address_from_text(text)
-            if address=="N/A": address=labeled(text,"Location")
-            phone=phone_from(text)
-            email=email_from(text)
-            category=labeled(text,"Category")
-            deals=labeled(text,"Listing Description")
-            if deals=="N/A": deals=labeled(text,"Description")
-            if deals=="N/A": deals=labeled(text,"Overview")
-            website="N/A"
-            # Enrich missing critical fields from profile page.
-            if detail_markers and (phone=="N/A" or address=="N/A" or deals=="N/A") and time.monotonic()<deadline:
-                d=detail_enrich(href,details,deadline)
-                phone=unique_join([phone,d.get("phone")]); email=unique_join([email,d.get("email")])
-                if address=="N/A": address=d.get("address","N/A")
-                if category=="N/A": category=d.get("category","N/A")
-                if deals=="N/A": deals=d.get("deals","N/A")
-                website=d.get("website","N/A")
-            rec=make_record(name,region,keyword,source,href,phone,website,address,category,deals,email)
-            if keyword_match(rec,keyword) and (address=="N/A" or region_match(address,region) or region_match(text,region)):
-                out.append(rec); seen_records.add(href)
-        nxt=next_page(soup,final)
-        if nxt and nxt not in seen_pages: queue.append(nxt)
-        # Queue plausible category/listing pages found on the current page. This helps
-        # sources whose search endpoint redirects to category pages.
-        for a in soup.find_all("a",href=True):
-            h=urllib.parse.urljoin(final,a["href"])
-            txt=norm(a.get_text(" ",strip=True))
-            if any(m in h.lower() for m in markers) and h not in seen_pages and h not in queue:
-                if keyword_match({"Company Name":txt,"Category":txt,"Business Deals In":txt,"Physical Address":txt,"Source URL":h},keyword):
-                    queue.append(h)
+            low = href.lower()
+            if any(p in low for p in exclude_patterns):
+                continue
+            card = a.parent
+            for _ in range(8):
+                if not getattr(card, "parent", None): break
+                txt = clean_text(card.get_text(" ", strip=True))
+                if len(txt) <= 3500 and any(k in txt.lower() for k in ["address", "phone", "contacts", "category", "overview", "description"]):
+                    break
+                card = card.parent
+            card_text = clean_text(card.get_text(" ", strip=True))
+            rec = build_record_from_profile(href, anchor_text, region, keyword, source, details, deadline, card_text)
+            if not rec:
+                continue
+            page_scoped = norm(keyword) in norm(final) or slug(keyword) in norm(final)
+            if (keyword_match(rec, keyword) or page_scoped) and (rec["Physical Address"] == "N/A" or region_match(rec["Physical Address"], region) or region_match(card_text, region)):
+                out.append(rec)
+                seen_records.add(href)
+        nxt = next_page(soup, final)
+        if nxt and nxt not in seen_pages:
+            queue.append(nxt)
+        # Queue only plausible search/category pages, never arbitrary internal links.
+        for a in soup.find_all("a", href=True):
+            h = urllib.parse.urljoin(final, a["href"])
+            txt = norm(a.get_text(" ", strip=True))
+            low = h.lower()
+            if h in seen_pages or h in queue or not any(m in low for m in markers):
+                continue
+            if any(p in low for p in exclude_patterns):
+                continue
+            if txt and (norm(keyword) in txt or any(t in txt for t in norm(keyword).split() if len(t) > 2)):
+                queue.append(h)
     return out
 
 
-def scrape_find(region,keyword,deadline):
-    q=urllib.parse.quote(keyword)
-    starts=[
-        f"https://find.ug/?s={q}",
-        f"https://find.ug/listings/?s={q}",
-        f"https://find.ug/listing-category/{slug(keyword)}/",
-        "https://find.ug/all-listings/",
-    ]
-    return generic_directory_crawl(starts,region,keyword,"Find.ug",["/listing/"],deadline)
+def scrape_find(region, keyword, deadline):
+    q = urllib.parse.quote(keyword)
+    return generic_directory_crawl([
+        f"https://find.ug/?s={q}", f"https://find.ug/listings/?s={q}",
+        f"https://find.ug/listing-category/{slug(keyword)}/", "https://find.ug/all-listings/"
+    ], region, keyword, "Find.ug", ["/listing/"], deadline,
+    exclude_patterns=["/listing-category/", "/category/", "/page/"])
 
 
-def scrape_hotfrog(region,keyword,deadline):
-    out=[]
-    for city in REGION_CITIES.get(region,[slug(region)]):
-        if time.monotonic()>=deadline or len(out)>=MAX_RECORDS_PER_SOURCE: break
-        base=f"https://www.hotfrog.ug/search/{slug(city)}/{slug(keyword)}"
-        recs=generic_directory_crawl([base],region,keyword,"Hotfrog Uganda",["/company/"],deadline)
-        out.extend(recs)
+def scrape_hotfrog(region, keyword, deadline):
+    out = []
+    for city in REGION_CITIES.get(region, [slug(region)]):
+        if time.monotonic() >= deadline or len(out) >= MAX_RECORDS_PER_SOURCE:
+            break
+        base = f"https://www.hotfrog.ug/search/{slug(city)}/{slug(keyword)}"
+        out.extend(generic_directory_crawl([base], region, keyword, "Hotfrog Uganda", ["/company/"], deadline, exclude_patterns=["/search/", "/category/", "/page/"]))
     return out[:MAX_RECORDS_PER_SOURCE]
 
 
-def scrape_finder(region,keyword,deadline):
-    starts=[
-        f"https://finderafrica.com/?s={urllib.parse.quote(keyword)}",
-        f"https://finderafrica.com/listing-category/{slug(keyword)}/",
-        "https://finderafrica.com/location/business-directory-uganda/",
-    ]
-    return generic_directory_crawl(starts,region,keyword,"FinderAfrica Uganda",["/listing/"],deadline)
+def scrape_finder(region, keyword, deadline):
+    q = urllib.parse.quote(keyword)
+    return generic_directory_crawl([
+        f"https://finderafrica.com/?s={q}", f"https://finderafrica.com/listing-category/{slug(keyword)}/",
+        "https://finderafrica.com/location/business-directory-uganda/"
+    ], region, keyword, "FinderAfrica Uganda", ["/listing/"], deadline,
+    exclude_patterns=["/listing-category/", "/category/", "/page/"])
 
 
-def scrape_yellowpages(region,keyword,deadline):
-    starts=[
-        f"https://www.yellowpages-uganda.com/?s={urllib.parse.quote(keyword)}",
-        "https://www.yellowpages-uganda.com/location/",
-    ]
-    # Search category/tag links discovered from the location index, then crawl listing pages.
-    html,final=http_html("https://www.yellowpages-uganda.com/location/")
+def scrape_yellowpages(region, keyword, deadline):
+    q = urllib.parse.quote(keyword)
+    starts = [f"https://www.yellowpages-uganda.com/?s={q}", "https://www.yellowpages-uganda.com/location/"]
+    html, final = http_html("https://www.yellowpages-uganda.com/location/")
     if html:
-        soup=soup_from(html); q=norm(keyword)
-        for a in soup.find_all("a",href=True):
-            h=urllib.parse.urljoin(final,a["href"]); t=norm(a.get_text(" ",strip=True))
-            if any(x in h.lower() for x in ["/listings/category/","/listings/tags/"]) and q and any(tok in t for tok in q.split() if len(tok)>2):
-                starts.insert(0,h)
-    return generic_directory_crawl(starts,region,keyword,"Yellow Pages Uganda",["/listings/"],deadline)
+        soup = soup_from(html)
+        qn = norm(keyword)
+        for a in soup.find_all("a", href=True):
+            h = urllib.parse.urljoin(final, a["href"]); t = norm(a.get_text(" ", strip=True))
+            if any(x in h.lower() for x in ["/listings/category/", "/listings/tags/"]) and (qn in t or any(tok in t for tok in qn.split() if len(tok) > 2)):
+                starts.insert(0, h)
+    return generic_directory_crawl(starts, region, keyword, "Yellow Pages Uganda", ["/listings/"], deadline,
+                                   exclude_patterns=["/listings/category/", "/listings/tags/", "/listings/page/"])
 
 
-def scrape_sme(region,keyword,deadline):
-    # National SME Portal is valuable because it exposes Region/Sub-region/District/Sector
-    # filters and a paginated national business directory. Its visible table contains names,
-    # sectors and districts; detail/contact enrichment is attempted when links are exposed.
-    starts=[
+def scrape_sme(region, keyword, deadline):
+    starts = [
         f"https://mybusiness.go.ug/Reports/SMEDirectory?Filters.SearchTerm={urllib.parse.quote(keyword)}",
         "https://mybusiness.go.ug/Reports/SMEDirectory",
     ]
-    out=[]; seen=set(); pages=0
+    out, seen, pages = [], set(), 0
+    allowed = REGION_DISTRICTS.get(region, set())
     for start in starts:
-        url=start
-        while url and pages<MAX_PAGES_PER_SOURCE and len(out)<MAX_RECORDS_PER_SOURCE and time.monotonic()<deadline:
-            if url in seen: break
-            seen.add(url); pages+=1
-            html,final=http_html(url)
+        url = start
+        while url and url not in seen and pages < MAX_PAGES_PER_SOURCE and len(out) < MAX_RECORDS_PER_SOURCE and time.monotonic() < deadline:
+            seen.add(url); pages += 1
+            html, final = http_html(url)
             if not html: break
-            soup=soup_from(html)
+            soup = soup_from(html)
             for row in soup.select("tr"):
-                cells=[clean_text(x.get_text(" ",strip=True)) for x in row.find_all(["td","th"])]
-                if len(cells)<3: continue
-                name=cells[1] if cells[0].isdigit() else cells[0]
-                sector=cells[2] if cells[0].isdigit() else cells[1]
-                district=cells[3] if cells[0].isdigit() and len(cells)>3 else (cells[2] if len(cells)>2 else "N/A")
-                text=" | ".join(cells)
-                rec=make_record(name,region,keyword,"National SME Portal",final,"N/A","N/A","N/A",sector,sector,"N/A",district=district)
-                district_norm=norm(district)
-                allowed=REGION_DISTRICTS.get(region,set())
-                region_ok=any(d and (d==district_norm or d in district_norm) for d in allowed)
-                # The portal's SearchTerm is the authoritative keyword filter for this source.
-                # If it is unavailable, retain rows whose name/sector contains the requested term.
-                search_filtered = "Filters.SearchTerm=" in start and urllib.parse.unquote(start.split("Filters.SearchTerm=",1)[1]).strip() != ""
-                if region_ok and (search_filtered or keyword_match(rec,keyword) or norm(keyword) in norm(sector) or norm(keyword) in norm(name)):
-                    out.append(rec)
-                    if len(out)>=MAX_RECORDS_PER_SOURCE: break
-            # Follow explicit next page links.
-            nxt=next_page(soup,final)
-            if not nxt:
-                # SME portal uses p=N query parameters.
-                m=re.search(r"[?&]p=(\d+)",final)
-                if m:
-                    n=int(m.group(1))+1
-                    nxt=re.sub(r"([?&])p=\d+", lambda m:m.group(1)+f"p={n}", final)
-            url=nxt
+                cells = [clean_text(x.get_text(" ", strip=True)) for x in row.find_all(["td", "th"])]
+                if len(cells) < 3: continue
+                offset = 1 if cells[0].isdigit() else 0
+                name = cells[offset]
+                sector = cells[offset + 1] if len(cells) > offset + 1 else "N/A"
+                district = cells[offset + 2] if len(cells) > offset + 2 else "N/A"
+                if not valid_business_name(name, keyword): continue
+                district_norm = norm(district)
+                region_ok = any(d and (d == district_norm or d in district_norm) for d in allowed)
+                search_filtered = "Filters.SearchTerm=" in start
+                if region_ok and (search_filtered or keyword_match({"Company Name": name, "Category": sector, "Business Deals In": sector, "Physical Address": district, "Source URL": final}, keyword)):
+                    out.append(make_record(name, region, keyword, "National SME Portal", final, category=sector, deals=sector, district=district, description=sector))
+            url = next_page(soup, final)
     return out[:MAX_RECORDS_PER_SOURCE]
 
 
-def scrape_kcca(region,keyword,deadline):
-    if region!="Kampala" or time.monotonic()>=deadline: return []
-    return generic_directory_crawl([
-        f"https://kcca.go.ug/businesses?business_name={urllib.parse.quote(keyword)}&business_nature={urllib.parse.quote(keyword)}",
-        "https://kcca.go.ug/businesses"
-    ],region,keyword,"KCCA Business Register",["/businesses"],deadline,detail_markers=False)
+def scrape_kcca(region, keyword, deadline):
+    if region != "Kampala" or time.monotonic() >= deadline:
+        return []
+    # KCCA is a table, not a profile directory. Extract only rows with a plausible business name.
+    urls = [f"https://kcca.go.ug/businesses?business_name={urllib.parse.quote(keyword)}&business_nature={urllib.parse.quote(keyword)}", "https://kcca.go.ug/businesses"]
+    out = []
+    for url in urls:
+        html, final = http_html(url)
+        if not html: continue
+        soup = soup_from(html)
+        for row in soup.select("tr"):
+            cells = [clean_text(x.get_text(" ", strip=True)) for x in row.find_all(["td", "th"])]
+            if len(cells) < 2: continue
+            name = cells[1] if cells[0].isdigit() and len(cells) > 1 else cells[0]
+            nature = cells[2] if cells[0].isdigit() and len(cells) > 2 else (cells[1] if len(cells) > 1 else "N/A")
+            division = cells[3] if cells[0].isdigit() and len(cells) > 3 else "N/A"
+            if valid_business_name(name, keyword) and (keyword_match({"Company Name": name, "Category": nature, "Business Deals In": nature, "Physical Address": division, "Source URL": final}, keyword) or norm(keyword) in norm(nature)):
+                out.append(make_record(name, region, keyword, "KCCA Business Register", final, category=nature, deals=nature, district=division, description=nature))
+        if out: break
+    return out[:MAX_RECORDS_PER_SOURCE]
 
 
+# ---------- OpenStreetMap ----------
 def osm_query(bbox, keyword):
-    """Build a compact Overpass query.
-
-    The previous version generated hundreds/thousands of regex clauses for each
-    Western Uganda bounding box. That was both slow and memory-heavy. We instead
-    search the most useful free-text fields plus common category fields in a small
-    number of queries.
-    """
     q = norm(keyword)
-    tokens = [t for t in q.split() if len(t) >= 3][:4]
-    terms = list(dict.fromkeys([q] + tokens))
+    tokens = [t for t in q.split() if len(t) >= 3 and t not in GENERIC_ACTIVITY][:4]
+    terms = list(dict.fromkeys(([q] if q else []) + tokens))
     blocks = []
+    keys = ["name", "brand", "operator", "description", "shop", "amenity", "office", "craft", "industrial", "healthcare", "tourism"]
     for term in terms:
         safe = re.sub(r"[^a-zA-Z0-9 _-]", "", term).strip()
-        if not safe:
-            continue
+        if not safe: continue
         pattern = re.escape(safe).replace(r"\ ", r"[ _-]+")
-        for key in ["name", "brand", "operator", "description", "shop", "amenity", "office", "craft", "industrial", "healthcare", "tourism"]:
+        for key in keys:
             blocks.append(f'nwr["{key}"~"{pattern}",i]({bbox});')
     return "[out:json][timeout:20];(\n" + "\n".join(blocks) + "\n);out center tags;"
 
 
 def fetch_osm_grid_data(region_name, keyword):
-    out = []
-    seen = set()
+    out, seen = [], set()
     deadline = time.monotonic() + SEARCH_BUDGET_SECONDS
-
     for bbox in REGION_BBOXES.get(region_name, []):
-        if time.monotonic() >= deadline or len(out) >= MAX_RECORDS_PER_SOURCE:
-            break
+        if time.monotonic() >= deadline or len(out) >= MAX_RECORDS_PER_SOURCE: break
         query = osm_query(bbox, keyword)
         for endpoint in OVERPASS:
-            if time.monotonic() >= deadline:
-                break
             try:
                 remaining = max(5, min(25, int(deadline - time.monotonic())))
                 r = requests.post(endpoint, data=query, headers={"User-Agent": USER_AGENT}, timeout=remaining)
-                if r.status_code != 200:
-                    continue
-                elements = r.json().get("elements", [])[:MAX_OSM_ELEMENTS_PER_QUERY]
-                for el in elements:
+                if r.status_code != 200: continue
+                for el in r.json().get("elements", [])[:MAX_OSM_ELEMENTS_PER_QUERY]:
                     tags = el.get("tags", {})
                     name = clean_text(tags.get("name"))
-                    if name == "N/A":
-                        continue
+                    if not valid_business_name(name, keyword): continue
                     c = el.get("center", {})
-                    lat = el.get("lat", c.get("lat", "N/A"))
-                    lng = el.get("lon", c.get("lon", "N/A"))
-                    addr = ", ".join(str(tags[k]) for k in [
-                        "addr:housenumber", "addr:street", "addr:place", "addr:suburb",
-                        "addr:city", "addr:district", "addr:postcode"
-                    ] if tags.get(k))
-                    category = next((clean_text(tags.get(k)) for k in [
-                        "shop", "amenity", "office", "craft", "industrial", "healthcare", "tourism"
-                    ] if tags.get(k)), "N/A")
-                    deals = clean_text(tags.get("description") or tags.get("operator") or tags.get("brand") or category)
-                    district = clean_text(tags.get("addr:district") or tags.get("is_in:district") or "N/A")
-                    rec = make_record(
-                        name, region_name, keyword, "OpenStreetMap", endpoint,
-                        tags.get("phone") or tags.get("contact:phone", "N/A"),
-                        tags.get("website") or tags.get("contact:website", "N/A"),
-                        addr or "N/A", category, deals,
-                        tags.get("email") or tags.get("contact:email", "N/A"),
-                        tags.get("rating", "N/A"), lat, lng, district
-                    )
-                    if not keyword_match(rec, keyword):
-                        continue
+                    lat, lng = el.get("lat", c.get("lat", "N/A")), el.get("lon", c.get("lon", "N/A"))
+                    addr = ", ".join(str(tags[k]) for k in ["addr:housenumber", "addr:street", "addr:place", "addr:suburb", "addr:city", "addr:district", "addr:postcode"] if tags.get(k))
+                    category = next((clean_text(tags.get(k)) for k in ["shop", "amenity", "office", "craft", "industrial", "healthcare", "tourism"] if tags.get(k)), "N/A")
+                    description = clean_text(tags.get("description") or "N/A")
+                    rec = make_record(name, region_name, keyword, "OpenStreetMap", endpoint, tags.get("phone") or tags.get("contact:phone", "N/A"), tags.get("website") or tags.get("contact:website", "N/A"), addr or "N/A", category, description, tags.get("email") or tags.get("contact:email", "N/A"), tags.get("rating", "N/A"), lat, lng, clean_text(tags.get("addr:district") or tags.get("is_in:district") or "N/A"), description)
+                    if not keyword_match(rec, keyword): continue
                     key = (norm(name), norm(addr) or norm(f"{lat}|{lng}"))
                     if key not in seen:
-                        seen.add(key)
-                        out.append(rec)
-                    if len(out) >= MAX_RECORDS_PER_SOURCE:
-                        break
-                # A successful endpoint is enough for this bbox; move to the next
-                # geographic area instead of duplicating every object from both mirrors.
+                        seen.add(key); out.append(rec)
+                    if len(out) >= MAX_RECORDS_PER_SOURCE: break
                 break
             except Exception:
                 continue
-
     fetch_osm_grid_data.last_count = len(out)
     return out[:MAX_RECORDS_PER_SOURCE]
 
+fetch_osm_grid_data.last_count = 0
 
-fetch_osm_grid_data.last_count=0
 
-
+# ---------- final dedupe / orchestration ----------
 def identity(r):
-    name=norm(r.get("Company Name")); addr=norm(r.get("Physical Address")); phone=re.sub(r"\D","",clean_text(r.get("Phone Contact")))
+    name, addr = norm(r.get("Company Name")), norm(r.get("Physical Address"))
+    phone = re.sub(r"\D", "", clean_text(r.get("Phone Contact")))
     if not name: return None
-    if addr and addr!="n a": return ("na",name,addr)
-    if phone: return ("np",name,phone)
-    return ("n",name)
+    return (name, addr if addr and addr != "n a" else "", phone if phone and phone != "n a" else "")
 
 
-def merge(a,b):
-    for k in ["Phone Contact","Email","Website","Physical Address","Rating","Lat","Lng","Category","Business Deals In"]:
-        if clean_text(b.get(k))!="N/A":
-            a[k]=unique_join([a.get(k),b.get(k)])
-    for k in ["Data Source","Source URL","Search Query"]:
-        a[k]=unique_join([a.get(k),b.get(k)])
+def _same_business(a, b):
+    na, nb = norm(a.get("Company Name")), norm(b.get("Company Name"))
+    if not na or na != nb:
+        return False
+    aa, ab = norm(a.get("Physical Address")), norm(b.get("Physical Address"))
+    pa = {re.sub(r"\D", "", x) for x in clean_text(a.get("Phone Contact")).split("|") if re.sub(r"\D", "", x)}
+    pb = {re.sub(r"\D", "", x) for x in clean_text(b.get("Phone Contact")).split("|") if re.sub(r"\D", "", x)}
+    if aa and aa != "n a" and ab and ab != "n a":
+        return aa == ab or bool(pa & pb)
+    return True
+
+
+def merge(a, b):
+    for k in ["Phone Contact", "Email", "Website", "Physical Address", "Rating", "Lat", "Lng", "Category", "Business Deals In", "District"]:
+        if clean_text(b.get(k)) != "N/A":
+            if k == "Business Deals In":
+                # Prefer the most specific one; never concatenate multiple activities.
+                old = clean_text(a.get(k))
+                new = clean_text(b.get(k))
+                if old == "N/A" or old == "Hardware" or len(new.split()) < len(old.split()):
+                    a[k] = new
+            else:
+                a[k] = unique_join([a.get(k), b.get(k)])
+    for k in ["Data Source", "Source URL", "Search Query"]:
+        a[k] = unique_join([a.get(k), b.get(k)])
     return a
 
 
 def deduplicate_records(records):
-    unique=OrderedDict()
+    unique = OrderedDict()
     for r in records:
-        key=identity(r)
-        if not key: continue
-        unique[key]=merge(unique[key],r) if key in unique else dict(r)
+        if not valid_business_name(r.get("Company Name", ""), r.get("Search Query", "")):
+            continue
+        key = identity(r)
+        if not key:
+            continue
+        matched_key = None
+        # First look for an existing record with the same genuine business name.
+        # If one side lacks address data, that record can be safely enriched. If both
+        # sides have different addresses, only merge when phone evidence agrees.
+        for existing_key, existing in unique.items():
+            if _same_business(existing, r):
+                matched_key = existing_key
+                break
+        if matched_key is None:
+            unique[key] = dict(r)
+        else:
+            unique[matched_key] = merge(unique[matched_key], r)
     return list(unique.values())
 
 
-def _run_source(name, fn, region, keyword):
-    deadline=time.monotonic()+SOURCE_BUDGET_SECONDS
+def _run_source(name, fn, region, keyword, budget):
+    deadline = time.monotonic() + budget
     try:
-        return name, fn(region,keyword,deadline), None
+        return name, fn(region, keyword, deadline), None
     except Exception as exc:
         return name, [], str(exc)[:250]
 
 
-def scrape_ugandan_directories(region_name,keyword):
-    jobs=[
-        ("Yellow Uganda",scrape_yellow),
-        ("Find.ug",scrape_find),
-        ("Hotfrog Uganda",scrape_hotfrog),
-        ("FinderAfrica Uganda",scrape_finder),
-        ("Yellow Pages Uganda",scrape_yellowpages),
-        ("National SME Portal",scrape_sme),
-        ("KCCA Business Register",scrape_kcca),
+def scrape_ugandan_directories(region_name, keyword):
+    jobs = [
+        ("Yellow Uganda", scrape_yellow, YELLOW_SOURCE_BUDGET_SECONDS),
+        ("Find.ug", scrape_find, DEFAULT_SOURCE_BUDGET_SECONDS),
+        ("Hotfrog Uganda", scrape_hotfrog, DEFAULT_SOURCE_BUDGET_SECONDS),
+        ("FinderAfrica Uganda", scrape_finder, DEFAULT_SOURCE_BUDGET_SECONDS),
+        ("Yellow Pages Uganda", scrape_yellowpages, DEFAULT_SOURCE_BUDGET_SECONDS),
+        ("National SME Portal", scrape_sme, DEFAULT_SOURCE_BUDGET_SECONDS),
+        ("KCCA Business Register", scrape_kcca, DEFAULT_SOURCE_BUDGET_SECONDS),
     ]
-    all_records=[]; counts={s:0 for s in SOURCE_NAMES}; errors={}
-    # Sources are independent. Run them concurrently so one slow site does not consume
-    # the entire search window. Each worker still has its own hard source deadline.
-    with ThreadPoolExecutor(max_workers=min(3, len(jobs))) as ex:
-        futures=[ex.submit(_run_source,n,f,region_name,keyword) for n,f in jobs]
-        for fut in as_completed(futures):
-            name,recs,err=fut.result(); counts[name]=len(recs); all_records.extend(recs)
-            if err: errors[name]=err
-    # Never replace missing physical addresses with the region name.
-    cleaned=[]
-    for r in all_records:
-        r["Physical Address"]=clean_text(r.get("Physical Address"))
-        if keyword_match(r,keyword):
-            # Keep records with N/A address if the source search itself was region-scoped.
-            cleaned.append(r)
-    result=deduplicate_records(cleaned)[:MAX_TOTAL_RESULTS]
-    scrape_ugandan_directories.last_source_counts=counts
-    scrape_ugandan_directories.last_source_errors=errors
+    all_records, counts, errors = [], {s: 0 for s in SOURCE_NAMES}, {}
+    # Sequential source processing is deliberate: it protects Streamlit Cloud memory.
+    # We give each source its own time budget so one blocked source cannot hold the others hostage.
+    for name, fn, budget in jobs:
+        source_name, recs, err = _run_source(name, fn, region_name, keyword, budget)
+        recs = [r for r in recs if valid_business_name(r.get("Company Name", ""), keyword)]
+        counts[source_name] = len(recs)
+        all_records.extend(recs)
+        if err:
+            errors[source_name] = err
+    result = deduplicate_records(all_records)[:MAX_TOTAL_RESULTS]
+    scrape_ugandan_directories.last_source_counts = counts
+    scrape_ugandan_directories.last_source_errors = errors
     return result
 
-scrape_ugandan_directories.last_source_counts={s:0 for s in SOURCE_NAMES}
-scrape_ugandan_directories.last_source_errors={}
+scrape_ugandan_directories.last_source_counts = {s: 0 for s in SOURCE_NAMES}
+scrape_ugandan_directories.last_source_errors = {}
