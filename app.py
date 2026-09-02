@@ -1,6 +1,7 @@
 import requests
 import streamlit as st
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from scraper import fetch_osm_grid_data, scrape_ugandan_directories, deduplicate_records, SOURCE_NAMES
 from database import init_database, save_and_deduplicate, get_leads
@@ -65,10 +66,20 @@ init_database()
 if not search_query.strip():
     st.warning("Enter a business keyword to start the directory search.")
 else:
-    with st.spinner(f"Searching {region} for '{search_query}' across all source groups..."):
-        osm_data = fetch_osm_grid_data(region, search_query)
+    with st.spinner(f"Searching {region} for '{search_query}' across all source groups and locations..."):
+        # Run OSM and the directory/registry pipeline at the same time. This
+        # keeps the broad geographic search from making the user wait for two
+        # completely separate phases.
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_osm = pool.submit(fetch_osm_grid_data, region, search_query)
+                f_dir = pool.submit(scrape_ugandan_directories, region, search_query)
+                osm_data = f_osm.result()
+                dir_data = f_dir.result()
+        except Exception:
+            osm_data = fetch_osm_grid_data(region, search_query)
+            dir_data = scrape_ugandan_directories(region, search_query)
         osm_count = getattr(fetch_osm_grid_data, "last_count", len(osm_data))
-        dir_data = scrape_ugandan_directories(region, search_query)
         directory_counts = dict(getattr(scrape_ugandan_directories, "last_source_counts", {}))
         combined = deduplicate_records(osm_data + dir_data)
         if combined:
@@ -81,11 +92,15 @@ else:
         source_counts["OpenStreetMap"] = int(osm_count)
         for source, count in directory_counts.items():
             source_counts[source] = int(count)
+        phones = int((df["phone_contact"].fillna("N/A") != "N/A").sum()) if "phone_contact" in df.columns else 0
+        addresses = int((df["physical_address"].fillna("N/A") != "N/A").sum()) if "physical_address" in df.columns else 0
+        emails = int((df["email"].fillna("N/A") != "N/A").sum()) if "email" in df.columns else 0
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Unique Places", len(df))
-        m2.metric("Region", region)
-        m3.metric("Search", search_query)
+        m2.metric("Phone Contacts", phones)
+        m3.metric("Physical Addresses", addresses)
         m4.metric("Source Groups", len([v for v in source_counts.values() if v > 0]))
+        st.caption(f"Contact coverage: {phones}/{len(df)} with phone • {addresses}/{len(df)} with address • {emails}/{len(df)} with email")
 
         st.markdown("---")
         st.subheader(f"Results for “{search_query}” in {region}")
@@ -94,7 +109,7 @@ else:
 
         display = [
             "No.", "company_name", "category", "business_deals_in", "phone_contact", "email",
-            "physical_address", "rating", "website", "data_source", "source_url"
+            "physical_address", "website", "data_source"
         ]
         display = [c for c in display if c in df.columns]
         st.dataframe(df[display], use_container_width=True, height=520)
