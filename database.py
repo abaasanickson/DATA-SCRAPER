@@ -49,6 +49,23 @@ def _clean(v):
     return str(v).strip()
 
 
+def _clean_address(v):
+    """Keep the physical-address field clean when directory cards concatenate fields."""
+    text = _clean(v)
+    if text == "N/A":
+        return text
+    import re
+    text = re.sub(r"^(?:physical\s+)?(?:address|location)\s*:\s*", "", text, flags=re.I)
+    m = re.search(r"\bUganda\b", text, flags=re.I)
+    if m:
+        text = text[:m.end()]
+    else:
+        text = re.split(r"\s+(?:View\s+Profile|View\s+Map|Get\s+Directions|Contact\s+number|Mobile\s+phone|Company\s+manager|Company\s+description|Listed\s+in\s+categories|Website\s+address|Working\s+hours)\b", text, maxsplit=1, flags=re.I)[0]
+        text = re.split(r"\s+(?:tel:)?\+?256[\s()./-]*\d{2,3}[\s()./-]*\d{3,4}[\s()./-]*\d{3,4}\b", text, maxsplit=1, flags=re.I)[0]
+        text = re.split(r"\s+0\d{2,3}[\s()./-]*\d{3,4}[\s()./-]*\d{3,4}\b", text, maxsplit=1)[0]
+    return text.strip(" ,;|-") or "N/A"
+
+
 def _merge(old, new):
     old, new = _clean(old), _clean(new)
     if old == "N/A": return new
@@ -80,7 +97,7 @@ def save_and_deduplicate(records):
     for r in records:
         try:
             name = _clean(r.get("Company Name"))
-            address = _clean(r.get("Physical Address"))
+            address = _clean_address(r.get("Physical Address"))
             existing_id = _find_existing(cur, name, address)
             values = {
                 "region": _clean(r.get("Region")),
@@ -145,6 +162,8 @@ def get_leads(region=None, search_query=None):
         conn,
         params=params,
     )
+    if "physical_address" in df.columns:
+        df["physical_address"] = df["physical_address"].apply(_clean_address)
     conn.close()
     return df
 
