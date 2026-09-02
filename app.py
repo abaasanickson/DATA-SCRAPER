@@ -46,31 +46,30 @@ def get_greeting():
 st.markdown(f"""
 <div class="welcome-card">
     <div class="welcome-title">{get_greeting()}. Ready to generate leads?</div>
-    <div class="welcome-subtitle">Maximum public-directory coverage across Kampala, Wakiso, Mukono, Masaka, Jinja & Western Uganda</div>
+    <div class="welcome-subtitle">Full coverage across Kampala, Wakiso, Mukono & Regional Directories</div>
     <div class="quote">{get_live_quote()}</div>
 </div>
 """, unsafe_allow_html=True)
 
 st.title("Full Region Business Lead Generator")
-st.caption("Direct Uganda Directory & Registry Search • Contact Enrichment • OpenStreetMap • Deduplicated results")
+st.caption("Direct Uganda Directory, Registry & OpenStreetMap Search • Multi-Source Expansion • Deduplicated results")
 
 st.sidebar.markdown("### ⚙️ Search Settings")
 region = st.sidebar.selectbox("Select Region", ["Kampala", "Wakiso", "Mukono", "Western Uganda", "Masaka", "Jinja"])
 search_query = st.sidebar.text_input("Business Type / Keyword", value="Hardware", help="Enter any business sector, service, company type or keyword. No fixed category list is required.")
 st.sidebar.markdown("---")
-st.sidebar.info("Each source is crawled independently. The crawler follows public pagination/category pages, enriches missing phone/address fields from business profiles where available, and never substitutes the region name for a physical address.")
+st.sidebar.info("Searches Uganda public directories/registries + Playwright headless browser + OpenStreetMap. Source failures are isolated and reported instead of silently replacing other sources.")
 
 init_database()
 
 if not search_query.strip():
     st.warning("Enter a business keyword to start the directory search.")
 else:
-    with st.spinner(f"Searching {region} for '{search_query}' across every configured source..."):
+    with st.spinner(f"Searching {region} for '{search_query}' across all source groups..."):
         osm_data = fetch_osm_grid_data(region, search_query)
         osm_count = getattr(fetch_osm_grid_data, "last_count", len(osm_data))
         dir_data = scrape_ugandan_directories(region, search_query)
         directory_counts = dict(getattr(scrape_ugandan_directories, "last_source_counts", {}))
-        directory_errors = dict(getattr(scrape_ugandan_directories, "last_source_errors", {}))
         combined = deduplicate_records(osm_data + dir_data)
         if combined:
             save_and_deduplicate(combined)
@@ -82,36 +81,23 @@ else:
         source_counts["OpenStreetMap"] = int(osm_count)
         for source, count in directory_counts.items():
             source_counts[source] = int(count)
-
-        phone_mask = df["phone_contact"].fillna("N/A").astype(str).str.strip().ne("N/A")
-        address_mask = df["physical_address"].fillna("N/A").astype(str).str.strip().ne("N/A")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Unique Leads", len(df))
-        m2.metric("Phone Coverage", f"{phone_mask.sum()}/{len(df)}")
-        m3.metric("Address Coverage", f"{address_mask.sum()}/{len(df)}")
-        m4.metric("Sources Returning Data", sum(v > 0 for v in source_counts.values()))
+        m1.metric("Total Unique Places", len(df))
+        m2.metric("Region", region)
+        m3.metric("Search", search_query)
+        m4.metric("Source Groups", len([v for v in source_counts.values() if v > 0]))
 
         st.markdown("---")
         st.subheader(f"Results for “{search_query}” in {region}")
-        st.caption("A missing phone means the public source did not expose one on the pages reached during this search; it is not replaced with a fake or regional number.")
-
         with st.expander("Source scan results", expanded=True):
-            rows=[]
-            for source in SOURCE_NAMES:
-                rows.append({
-                    "Source": source,
-                    "Records Found": source_counts.get(source,0),
-                    "Status": "OK" if source_counts.get(source,0)>0 else ("Error/blocked" if source in directory_errors else "No matching public records"),
-                    "Error": directory_errors.get(source,"")
-                })
-            st.dataframe(pd.DataFrame(rows).sort_values(["Records Found","Source"], ascending=[False,True]), use_container_width=True, height=330)
+            st.write(pd.DataFrame(sorted(source_counts.items(), key=lambda x: (-x[1], x[0])), columns=["Source", "Records returned"]))
 
         display = [
             "No.", "company_name", "category", "business_deals_in", "phone_contact", "email",
-            "physical_address", "district", "rating", "website", "data_source", "source_url"
+            "physical_address", "rating", "website", "data_source", "source_url"
         ]
         display = [c for c in display if c in df.columns]
-        st.dataframe(df[display], use_container_width=True, height=560)
+        st.dataframe(df[display], use_container_width=True, height=520)
 
         st.markdown("---")
         csv = df.drop(columns=["No.", "id"], errors="ignore").to_csv(index=False).encode("utf-8")
